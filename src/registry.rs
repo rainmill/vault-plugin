@@ -74,6 +74,10 @@ pub struct SlotReg {
     pub reason: Option<Text>,
     /// Whether several credentials may be attached and cycled through.
     pub pooled: bool,
+    /// What one unit is, in the plural, as the usage screen names it.
+    pub unit: Option<Text>,
+    /// The meters its use is counted under, each with its own price.
+    pub meters: Vec<(String, Text)>,
 }
 
 impl SlotReg {
@@ -86,6 +90,8 @@ impl SlotReg {
             kind: kind.into(),
             reason: None,
             pooled: false,
+            unit: None,
+            meters: Vec::new(),
         }
     }
 
@@ -106,6 +112,20 @@ impl SlotReg {
     /// What the module does with the credential, shown where one is attached.
     pub fn reason(mut self, reason: impl Into<Text>) -> Self {
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// What one unit is, in the plural: "profiles", "messages".
+    pub fn unit(mut self, unit: impl Into<Text>) -> Self {
+        self.unit = Some(unit.into());
+        self
+    }
+
+    /// Adds a meter: a split of the slot's use that is counted and priced on
+    /// its own. The module reports a use under it with
+    /// [`Lease::used_as`](crate::Lease::used_as).
+    pub fn meter(mut self, code: impl Into<String>, label: impl Into<Text>) -> Self {
+        self.meters.push((code.into(), label.into()));
         self
     }
 }

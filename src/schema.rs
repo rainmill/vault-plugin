@@ -60,4 +60,19 @@ pub(crate) enum VaultUsage {
     Calls,
     Errors,
     Units,
+    /// The slot's own split of what it spends; empty when it has none.
+    Meter,
+}
+
+/// The price of one unit for a slot and a meter.
+#[derive(Iden)]
+pub(crate) enum VaultRates {
+    Table,
+    Id,
+    Slot,
+    Meter,
+    /// A decimal number, as text.
+    Price,
+    Currency,
+    UpdatedAt,
 }

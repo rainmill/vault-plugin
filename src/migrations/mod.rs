@@ -4,4 +4,5 @@
 laterite_core::migration_set! {
     module_id: "rainmill.vault",
     m0001_create_vault,
+    m0002_add_meters_and_rates,
 }

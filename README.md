@@ -80,12 +80,29 @@ match call(token).await {
 | `lease.label()` | The label an administrator gave it, for a log line. |
 | `lease.remaining()` | Units left this period, when it has an allowance. |
 | `lease.used(units)` | It worked and spent `units`. |
+| `lease.used_as(meter, units)` | It worked and spent `units`, counted under one of the slot's meters. |
 | `lease.failed(status, message)` | It failed. A 401, 402 or 403 takes it out of the cycle for an hour and shows it as refused. |
 
 | Error | Meaning |
 |---|---|
 | `VaultError::Unbound` | Nothing is attached to the slot. |
 | `VaultError::NoneUsable` | Everything attached is refused, expired or at its allowance; the error names each. |
+
+## Usage and cost
+
+```rust
+registry.add(
+    SlotReg::pooled("acme.messages.api", "acme.token")
+        .label(t!("Messages"))
+        .unit(t!("Messages sent"))
+        .meter("marketing", t!("Marketing"))
+        .meter("utility", t!("Utility")),
+);
+```
+
+Each slot has a Usage page under Credentials: a period bar, charts by meter and
+by credential, and calls against errors. A price a unit, set on the page for each
+meter, adds an estimated cost and a projection for the month.
 
 ## Permissions
 

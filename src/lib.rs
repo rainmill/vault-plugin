@@ -137,7 +137,13 @@ impl Lease {
 
     /// The use succeeded and spent `units` of the allowance.
     pub async fn used(self, units: i64) -> Result<(), VaultError> {
-        store::spent(&self.db, self.item.id, &self.slot, units).await
+        store::spent(&self.db, self.item.id, &self.slot, "", units).await
+    }
+
+    /// The use succeeded and spent `units` of the allowance, counted under one
+    /// of the slot's meters (see [`SlotReg::meter`]).
+    pub async fn used_as(self, meter: &str, units: i64) -> Result<(), VaultError> {
+        store::spent(&self.db, self.item.id, &self.slot, meter, units).await
     }
 
     /// The use failed. A `status` of 401, 402 or 403 means the provider would

@@ -103,6 +103,8 @@ pub(crate) fn check(registry: &Registry) -> CoreResult<()> {
     Ok(())
 }
 
+mod usage;
+
 struct Credentials;
 
 #[derive(Clone)]
@@ -143,7 +145,46 @@ impl Screen for Credentials {
         let c = |cx: &Cx| cx.clone();
         let (index_cx, new_cx, create_cx, edit_cx, update_cx, delete_cx, reveal_cx) =
             (c(&cx), c(&cx), c(&cx), c(&cx), c(&cx), c(&cx), c(&cx));
+        let (usage_home_cx, usage_cx, rates_cx) = (c(&cx), c(&cx), c(&cx));
         Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let cx = usage_home_cx.clone();
+                    async move {
+                        match cx.slots.first() {
+                            Some(slot) => {
+                                Redirect::to(&cx.ctx.url(&format!("usage/{}", slot.code)))
+                                    .into_response()
+                            }
+                            None => Redirect::to(&cx.index()).into_response(),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/usage/{slot}",
+                get(
+                    move |Path(slot): Path<String>,
+                          Query(query): Query<laterite_admin::chart::ChartQuery>,
+                          Extension(shell): Extension<Shell>| {
+                        let cx = usage_cx.clone();
+                        async move { usage::page(&cx, shell, &slot, query).await }
+                    },
+                ),
+            )
+            .route(
+                "/usage/{slot}/rates",
+                post(
+                    move |Path(slot): Path<String>,
+                          Extension(user): Extension<AuthenticatedUser>,
+                          Extension(session): Extension<SessionHandle>,
+                          Form(data): Form<HashMap<String, String>>| {
+                        let cx = rates_cx.clone();
+                        async move { usage::save_rates(&cx, user, session, &slot, data).await }
+                    },
+                ),
+            )
             .route(
                 "/",
                 get(move |Extension(shell): Extension<Shell>| {
@@ -379,7 +420,7 @@ async fn index(cx: &Cx, shell: Shell) -> Response {
                     .join("<br>")
             };
             rows.push_str(&format!(
-                "<tr><td><strong>{}</strong>{}</td><td>{}</td><td>{}</td><td>{list}</td></tr>",
+                "<tr><td><strong>{}</strong>{}</td><td>{}</td><td>{}</td><td>{list}</td><td><a href=\"{usage}\">{usage_label}</a></td></tr>",
                 escape(&shell.tt(&slot.label)),
                 slot.reason
                     .as_ref()
@@ -394,10 +435,12 @@ async fn index(cx: &Cx, shell: Shell) -> Response {
                 } else {
                     shell.t("One")
                 }),
+                usage = escape(&cx.ctx.url(&format!("usage/{}", slot.code))),
+                usage_label = escape(&shell.t("Usage")),
             ));
         }
         body.push_str(&format!(
-            "<div class=\"lat-tablewrap\"><table class=\"lat-table\"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>",
+            "<div class=\"lat-tablewrap\"><table class=\"lat-table\"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>",
             escape(&shell.t("Use")),
             escape(&shell.t("Kind")),
             escape(&shell.t("Takes")),

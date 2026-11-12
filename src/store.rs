@@ -15,7 +15,9 @@ use laterite_core::sqlx::{self, Row};
 use laterite_core::{AnyRowExt, Crypt, Db};
 use sea_query::{Expr, Iden, Order, Query};
 
-use crate::schema::{VaultBindings as Bindings, VaultItems as Items, VaultUsage as Usage};
+use crate::schema::{
+    VaultBindings as Bindings, VaultItems as Items, VaultRates as Rates, VaultUsage as Usage,
+};
 use crate::VaultError;
 
 /// The column the fields are sealed in, which is also the AAD.
@@ -523,7 +525,13 @@ pub(crate) async fn take(
 
 /// Records a use of an item for a slot: `units` against its allowance, and
 /// the item back in good standing.
-pub(crate) async fn spent(db: &Db, item_id: i64, slot: &str, units: i64) -> Result<(), VaultError> {
+pub(crate) async fn spent(
+    db: &Db,
+    item_id: i64,
+    slot: &str,
+    meter: &str,
+    units: i64,
+) -> Result<(), VaultError> {
     let units = units.max(0);
     let (sql, values) = build(
         db.backend,
@@ -538,7 +546,7 @@ pub(crate) async fn spent(db: &Db, item_id: i64, slot: &str, units: i64) -> Resu
     bind_values(sqlx::query(&sql), values)
         .execute(&db.pool)
         .await?;
-    count(db, item_id, slot, 1, 0, units).await
+    count(db, item_id, slot, meter, 1, 0, units).await
 }
 
 /// Records a failed use. A refusal (the provider would not take the
@@ -568,14 +576,15 @@ pub(crate) async fn failed(
     bind_values(sqlx::query(&sql), values)
         .execute(&db.pool)
         .await?;
-    count(db, item_id, slot, 0, 1, 0).await
+    count(db, item_id, slot, "", 0, 1, 0).await
 }
 
-/// Adds to the day's counts for an item and a slot.
+/// Adds to the day's counts for an item, a slot and a meter.
 async fn count(
     db: &Db,
     item_id: i64,
     slot: &str,
+    meter: &str,
     calls: i64,
     errors: i64,
     units: i64,
@@ -585,9 +594,19 @@ async fn count(
         db.backend,
         Query::insert()
             .into_table(Usage::Table)
-            .columns([Usage::ItemId, Usage::Slot, Usage::Day])
-            .values_panic([item_id.into(), slot.into(), day.clone().into()])
-            .on_conflict(on_conflict_ignore([Usage::ItemId, Usage::Slot, Usage::Day]))
+            .columns([Usage::ItemId, Usage::Slot, Usage::Day, Usage::Meter])
+            .values_panic([
+                item_id.into(),
+                slot.into(),
+                day.clone().into(),
+                meter.into(),
+            ])
+            .on_conflict(on_conflict_ignore([
+                Usage::ItemId,
+                Usage::Slot,
+                Usage::Day,
+                Usage::Meter,
+            ]))
             .to_owned(),
     );
     bind_values(sqlx::query(&sql), values)
@@ -603,6 +622,7 @@ async fn count(
             .and_where(Expr::col(Usage::ItemId).eq(item_id))
             .and_where(Expr::col(Usage::Slot).eq(slot))
             .and_where(Expr::col(Usage::Day).eq(day))
+            .and_where(Expr::col(Usage::Meter).eq(meter))
             .to_owned(),
     );
     bind_values(sqlx::query(&sql), values)
@@ -652,6 +672,165 @@ pub async fn usage(
         }
     }
     Ok(out)
+}
+
+/// What one credential spent for a slot and a meter on a day.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageRow {
+    /// The day, in UTC.
+    pub day: NaiveDate,
+    /// The credential's row id.
+    pub item_id: i64,
+    /// The slot it was leased through.
+    pub slot: String,
+    /// The slot's meter, empty when the use named none.
+    pub meter: String,
+    /// Uses that succeeded.
+    pub calls: i64,
+    /// Uses that failed.
+    pub errors: i64,
+    /// Units spent.
+    pub units: i64,
+}
+
+/// Every count from `from` to `to`, both days included, for one slot or for
+/// all of them, oldest first.
+pub async fn usage_between(
+    db: &Db,
+    slot: Option<&str>,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Result<Vec<UsageRow>, VaultError> {
+    let (sql, values) = {
+        let mut select = Query::select();
+        select
+            .columns([
+                Usage::Day,
+                Usage::ItemId,
+                Usage::Slot,
+                Usage::Meter,
+                Usage::Calls,
+                Usage::Errors,
+                Usage::Units,
+            ])
+            .from(Usage::Table)
+            .and_where(Expr::col(Usage::Day).gte(from.to_string()))
+            .and_where(Expr::col(Usage::Day).lte(to.to_string()))
+            .order_by(Usage::Day, Order::Asc);
+        if let Some(slot) = slot {
+            select.and_where(Expr::col(Usage::Slot).eq(slot));
+        }
+        build(db.backend, select)
+    };
+    let rows = bind_values(sqlx::query(&sql), values)
+        .fetch_all(&db.pool)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Ok(day) = NaiveDate::parse_from_str(&row.get_text("day")?, "%Y-%m-%d") else {
+            continue;
+        };
+        out.push(UsageRow {
+            day,
+            item_id: row.try_get::<i64, _>("item_id")?,
+            slot: row.get_text("slot")?,
+            meter: row.get_text("meter")?,
+            calls: row.try_get::<i64, _>("calls")?,
+            errors: row.try_get::<i64, _>("errors")?,
+            units: row.try_get::<i64, _>("units")?,
+        });
+    }
+    Ok(out)
+}
+
+/// The price of one unit for a slot and a meter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rate {
+    /// The slot's code.
+    pub slot: String,
+    /// The slot's meter, empty for a slot without meters.
+    pub meter: String,
+    /// The price of one unit.
+    pub price: f64,
+    /// The price as it was entered.
+    pub entered: String,
+    /// The ISO currency code.
+    pub currency: String,
+}
+
+/// Every stored rate.
+pub async fn rates(db: &Db) -> Result<Vec<Rate>, VaultError> {
+    let (sql, values) = build(
+        db.backend,
+        Query::select()
+            .columns([Rates::Slot, Rates::Meter, Rates::Price, Rates::Currency])
+            .from(Rates::Table)
+            .to_owned(),
+    );
+    let rows = bind_values(sqlx::query(&sql), values)
+        .fetch_all(&db.pool)
+        .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let entered = row.get_text("price")?;
+        out.push(Rate {
+            slot: row.get_text("slot")?,
+            meter: row.get_text("meter")?,
+            price: entered.parse().unwrap_or(0.0),
+            entered,
+            currency: row.get_text("currency")?,
+        });
+    }
+    Ok(out)
+}
+
+/// Stores the price of one unit for a slot and a meter, or removes it when
+/// `price` is `None`.
+pub async fn set_rate(
+    db: &Db,
+    slot: &str,
+    meter: &str,
+    price: Option<&str>,
+    currency: &str,
+) -> Result<(), VaultError> {
+    let (sql, values) = build(
+        db.backend,
+        Query::delete()
+            .from_table(Rates::Table)
+            .and_where(Expr::col(Rates::Slot).eq(slot))
+            .and_where(Expr::col(Rates::Meter).eq(meter))
+            .to_owned(),
+    );
+    bind_values(sqlx::query(&sql), values)
+        .execute(&db.pool)
+        .await?;
+    let Some(price) = price else {
+        return Ok(());
+    };
+    let (sql, values) = build(
+        db.backend,
+        Query::insert()
+            .into_table(Rates::Table)
+            .columns([
+                Rates::Slot,
+                Rates::Meter,
+                Rates::Price,
+                Rates::Currency,
+                Rates::UpdatedAt,
+            ])
+            .values_panic([
+                slot.into(),
+                meter.into(),
+                price.into(),
+                currency.into(),
+                now().into(),
+            ])
+            .to_owned(),
+    );
+    bind_values(sqlx::query(&sql), values)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]

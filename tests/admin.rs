@@ -33,7 +33,10 @@ fn registry() -> Registry {
     registry.add(
         SlotReg::pooled(POOL, "acme.token")
             .label(t!("Stock sync"))
-            .reason(t!("Reads stock levels through the day")),
+            .reason(t!("Reads stock levels through the day"))
+            .unit(t!("Lookups"))
+            .meter("fresh", t!("Fresh"))
+            .meter("cached", t!("Cached")),
     );
     registry.add(SlotReg::single(SINGLE, "acme.token").label(t!("Mailer")));
     registry
@@ -295,4 +298,91 @@ async fn a_credential_is_added_attached_changed_revealed_and_deleted() {
     // Signed out, nothing answers.
     let (status, _) = get(&app, &format!("{BASE}/"), "").await;
     assert!(status.is_redirection());
+}
+
+#[tokio::test]
+async fn usage_is_charted_by_meter_and_priced() {
+    let (db, _guard, crypt, app, token) = setup().await;
+    let base = "/admin/rainmill/vault/credentials";
+    let (status, _) = post(
+        &app,
+        &format!("{base}/new?kind=acme.token"),
+        &token,
+        "label=Main&token=secret-one&slot_0=on",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    // Two uses under two meters, and one with no meter named.
+    for (meter, units) in [("fresh", 30), ("cached", 10)] {
+        let lease = rainmill_vault::lease(&db, &crypt, POOL).await.unwrap();
+        lease.used_as(meter, units).await.unwrap();
+    }
+    let lease = rainmill_vault::lease(&db, &crypt, POOL).await.unwrap();
+    lease.used(5).await.unwrap();
+    let today = chrono::Utc::now().date_naive();
+    let rows = rainmill_vault::store::usage_between(&db, Some(POOL), today, today)
+        .await
+        .unwrap();
+    let mut by_meter: Vec<(String, i64)> =
+        rows.iter().map(|r| (r.meter.clone(), r.units)).collect();
+    by_meter.sort();
+    assert_eq!(
+        by_meter,
+        vec![
+            (String::new(), 5),
+            ("cached".to_string(), 10),
+            ("fresh".to_string(), 30)
+        ]
+    );
+
+    // The bare address goes to the first slot's page.
+    let (status, _) = get(&app, &format!("{base}/usage"), &token).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let page = format!("{base}/usage/{POOL}");
+    let (status, html) = get(&app, &page, &token).await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    // A series a meter, the unnamed use under Other, and no cost without a price.
+    assert!(html.contains("<span>Fresh</span><b>30</b>"), "{html}");
+    assert!(html.contains("<span>Cached</span><b>10</b>"), "{html}");
+    assert!(html.contains("<span>Other</span><b>5</b>"), "{html}");
+    assert!(html.contains("<span>Lookups</span><b>45</b>"), "{html}");
+    assert!(!html.contains("Projected for the month"), "{html}");
+    assert!(html.contains("chart."), "the page loads the chart styles: {html}");
+
+    // A price that is no number changes nothing.
+    let (status, _) = post(
+        &app,
+        &format!("{page}/rates"),
+        &token,
+        "price_0=abc&price_1=0.5&currency=inr",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(rainmill_vault::store::rates(&db).await.unwrap().is_empty());
+
+    let (status, _) = post(
+        &app,
+        &format!("{page}/rates"),
+        &token,
+        "price_0=0.1&price_1=&currency=inr",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let rates = rainmill_vault::store::rates(&db).await.unwrap();
+    assert_eq!(rates.len(), 1);
+    assert_eq!(
+        (rates[0].meter.as_str(), rates[0].price, rates[0].currency.as_str()),
+        ("fresh", 0.1, "INR")
+    );
+    // Thirty fresh lookups at 0.1 each.
+    let (_, html) = get(&app, &page, &token).await;
+    assert!(
+        html.contains("<span>Estimated cost</span><b>INR 3.00</b>"),
+        "{html}"
+    );
+    assert!(html.contains("Projected for the month"), "{html}");
+    // The slots table links here.
+    let (_, index) = get(&app, base, &token).await;
+    assert!(index.contains(&format!("{page}\">Usage</a>")), "{index}");
 }
