@@ -92,7 +92,11 @@ pub(super) async fn page(cx: &Cx, shell: Shell, slot: &str, query: ChartQuery) -
         for other in cx.slots.iter() {
             tabs.push_str(&format!(
                 r#"<a class="lat-period__preset{}" href="{}?{}">{}</a>"#,
-                if other.code == slot.code { " is-on" } else { "" },
+                if other.code == slot.code {
+                    " is-on"
+                } else {
+                    ""
+                },
                 escape(&cx.ctx.url(&format!("usage/{}", other.code))),
                 escape(&period.query()),
                 escape(&shell.tt(&other.label)),
@@ -106,8 +110,8 @@ pub(super) async fn page(cx: &Cx, shell: Shell, slot: &str, query: ChartQuery) -
 
     // The figures.
     let units: i64 = rows.iter().map(|r| r.units).sum();
-    let mut figures = vec![Stat::new(unit.clone(), Format::Number.text(units as f64))
-        .note(t!("In this period"))];
+    let mut figures =
+        vec![Stat::new(unit.clone(), Format::Number.text(units as f64)).note(t!("In this period"))];
     if !rates.is_empty() {
         let month_cost = cost(&month, &rates);
         figures.push(
@@ -241,11 +245,7 @@ pub(super) async fn page(cx: &Cx, shell: Shell, slot: &str, query: ChartQuery) -
         save = escape(&shell.t("Save prices")),
     ));
 
-    let title = Text::dynamic(format!(
-        "{}: {}",
-        shell.t("Usage"),
-        shell.tt(&slot.label)
-    ));
+    let title = Text::dynamic(format!("{}: {}", shell.t("Usage"), shell.tt(&slot.label)));
     shell.page_with(
         PageHead::new(title)
             .back(t!("Credentials"), cx.index())
@@ -280,7 +280,10 @@ pub(super) async fn save_rates(
             .unwrap_or_default();
         if entered.is_empty() {
             prices.push((code, None));
-        } else if entered.parse::<f64>().is_ok_and(|p| p.is_finite() && p >= 0.0) {
+        } else if entered
+            .parse::<f64>()
+            .is_ok_and(|p| p.is_finite() && p >= 0.0)
+        {
             prices.push((code, Some(entered)));
         } else {
             session.push_flash(
@@ -318,6 +321,9 @@ mod tests {
         let day = |d| NaiveDate::from_ymd_opt(2026, 11, d).unwrap();
         assert_eq!(projected(10.0, day(10)), 30.0);
         assert_eq!(projected(30.0, day(30)), 30.0);
-        assert_eq!(month_end(NaiveDate::from_ymd_opt(2026, 2, 3).unwrap()).day(), 28);
+        assert_eq!(
+            month_end(NaiveDate::from_ymd_opt(2026, 2, 3).unwrap()).day(),
+            28
+        );
     }
 }

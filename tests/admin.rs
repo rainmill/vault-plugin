@@ -348,7 +348,10 @@ async fn usage_is_charted_by_meter_and_priced() {
     assert!(html.contains("<span>Other</span><b>5</b>"), "{html}");
     assert!(html.contains("<span>Lookups</span><b>45</b>"), "{html}");
     assert!(!html.contains("Projected for the month"), "{html}");
-    assert!(html.contains("chart."), "the page loads the chart styles: {html}");
+    assert!(
+        html.contains("chart."),
+        "the page loads the chart styles: {html}"
+    );
 
     // A price that is no number changes nothing.
     let (status, _) = post(
@@ -372,7 +375,11 @@ async fn usage_is_charted_by_meter_and_priced() {
     let rates = rainmill_vault::store::rates(&db).await.unwrap();
     assert_eq!(rates.len(), 1);
     assert_eq!(
-        (rates[0].meter.as_str(), rates[0].price, rates[0].currency.as_str()),
+        (
+            rates[0].meter.as_str(),
+            rates[0].price,
+            rates[0].currency.as_str()
+        ),
         ("fresh", 0.1, "INR")
     );
     // Thirty fresh lookups at 0.1 each.
