@@ -170,6 +170,26 @@ pub async fn lease(db: &Db, crypt: &Crypt, slot: &str) -> Result<Lease, VaultErr
     })
 }
 
+/// Hands out the first credential attached to `slot` whatever its standing,
+/// for a test of the credential itself. [`used`](Lease::used) puts it back in
+/// good standing; dropping the lease unreported leaves it as it was.
+///
+/// [`VaultError::Unbound`] when nothing is attached.
+pub async fn inspect(db: &Db, crypt: &Crypt, slot: &str) -> Result<Lease, VaultError> {
+    let item = store::items_of(db, slot)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| VaultError::Unbound(slot.to_string()))?;
+    let fields = store::fields(db, crypt, item.id).await?;
+    Ok(Lease {
+        db: db.clone(),
+        slot: slot.to_string(),
+        item,
+        fields,
+    })
+}
+
 /// Checks the kinds and slots a registry holds can work together: no code
 /// twice, no field of a kind under a name the form uses itself, no slot for a
 /// kind nobody registered. The module runs it at boot.
