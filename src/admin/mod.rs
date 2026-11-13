@@ -183,8 +183,18 @@ impl Screen for Credentials {
         let (index_cx, new_cx, create_cx, edit_cx, update_cx, delete_cx, reveal_cx) =
             (c(&cx), c(&cx), c(&cx), c(&cx), c(&cx), c(&cx), c(&cx));
         let (usage_home_cx, usage_cx, rates_cx) = (c(&cx), c(&cx), c(&cx));
-        let act_cx = c(&cx);
+        let (act_cx, part_cx) = (c(&cx), c(&cx));
         Router::new()
+            .route(
+                "/{id}/act/{code}/{part}",
+                post(
+                    move |Path((id, code, part)): Path<(i64, String, String)>,
+                          Extension(shell): Extension<Shell>| {
+                        let cx = part_cx.clone();
+                        async move { act_part(&cx, shell, id, &code, &part).await }
+                    },
+                ),
+            )
             .route(
                 "/{id}/act/{code}",
                 post(
@@ -981,7 +991,7 @@ async fn act(
     id: i64,
     code: &str,
 ) -> Response {
-    use crate::action::{ActionCx, Outcome, State};
+    use crate::action::{ActionCx, Outcome};
     let db = cx.ctx.db();
     let item = match store::find(db, id).await {
         Ok(Some(item)) => item,
@@ -995,6 +1005,40 @@ async fn act(
         Ok(fields) => fields,
         Err(e) => return failure(e),
     };
+    let parts = action.action.parts();
+    if !parts.is_empty() {
+        cx.ctx
+            .audit(
+                &user,
+                "rainmill.vault.credential.action",
+                Some("vault_items"),
+                Some(&id.to_string()),
+                Some(&item.label),
+                Some(code),
+            )
+            .await;
+        // Every row at once, each asking for its own result as the page opens.
+        let rows: String = parts
+            .iter()
+            .map(|part| {
+                format!(
+                    r#"<tr hx-post="{}" hx-trigger="load" hx-swap="outerHTML"><td><strong>{}</strong></td><td><span class="lat-badge" data-tone="wait">{}</span></td><td></td></tr>"#,
+                    escape(&cx.ctx.url(&format!("{id}/act/{code}/{}", part.code))),
+                    escape(&shell.tt(&part.label)),
+                    escape(&shell.t("Testing")),
+                )
+            })
+            .collect();
+        return report_page(
+            cx,
+            &shell,
+            &item,
+            action,
+            action.action.note().as_ref(),
+            &rows,
+            &[],
+        );
+    }
     let outcome = action
         .action
         .run(&ActionCx {
@@ -1030,22 +1074,56 @@ async fn act(
             return failure(e);
         }
     }
-    let mut rows = String::new();
-    for line in &report.lines {
-        let (tone, word) = match line.state {
-            State::Works => ("ok", t!("Works")),
-            State::Failed => ("bad", t!("Failed")),
-            State::NotTried => ("wait", t!("Not tried")),
-        };
-        rows.push_str(&format!(
-            r#"<tr><td><strong>{}</strong></td><td><span class="lat-badge" data-tone="{tone}">{}</span></td><td>{}</td></tr>"#,
-            escape(&shell.tt(&line.label)),
-            escape(&shell.tt(&word)),
-            escape(&line.detail),
-        ));
-    }
+    let rows: String = report
+        .lines
+        .iter()
+        .map(|line| row(&shell, &line.label, line.state, &line.detail, ""))
+        .collect();
+    report_page(
+        cx,
+        &shell,
+        &item,
+        action,
+        report.note.as_ref(),
+        &rows,
+        &report.offer,
+    )
+}
+
+/// One finished row of a report: `extra` is markup after the detail.
+fn row(
+    shell: &Shell,
+    label: &Text,
+    state: crate::action::State,
+    detail: &str,
+    extra: &str,
+) -> String {
+    use crate::action::State;
+    let (tone, word) = match state {
+        State::Works => ("ok", t!("Works")),
+        State::Failed => ("bad", t!("Failed")),
+        State::NotTried => ("wait", t!("Not tried")),
+    };
+    format!(
+        r#"<tr><td><strong>{}</strong></td><td><span class="lat-badge" data-tone="{tone}">{}</span></td><td>{}{extra}</td></tr>"#,
+        escape(&shell.tt(label)),
+        escape(&shell.tt(&word)),
+        escape(detail),
+    )
+}
+
+/// The page an action's report shows on: run again, what it offers, the rows.
+fn report_page(
+    cx: &Cx,
+    shell: &Shell,
+    item: &Item,
+    action: &ActionReg,
+    note: Option<&Text>,
+    rows: &str,
+    offer: &[String],
+) -> Response {
     let mut body = String::new();
-    if let Some(note) = &report.note {
+    if let Some(note) = note {
         body.push_str(&format!(
             r#"<p class="lat-note">{}</p>"#,
             escape(&shell.tt(note))
@@ -1057,26 +1135,83 @@ async fn act(
         escape(&shell.t("Result")),
         escape(&shell.t("Detail")),
     ));
-    // Run again, then whatever the report offers.
-    let mut buttons = action_button(cx, id, action).render(&shell).into_string();
+    let mut buttons = action_button(cx, item.id, action)
+        .render(shell)
+        .into_string();
     for offered in cx
         .actions_for(&item.kind)
-        .filter(|a| a.code != code && report.offer.contains(&a.code))
+        .filter(|a| a.code != action.code && offer.contains(&a.code))
     {
         buttons.push_str(
-            action_button(cx, id, offered)
+            action_button(cx, item.id, offered)
                 .primary()
-                .render(&shell)
+                .render(shell)
                 .as_str(),
         );
     }
     let title = Text::dynamic(format!("{}: {}", shell.tt(&action.label), item.label));
-    shell.page_with(
+    shell.clone().page_with(
         PageHead::new(title)
-            .back(Text::dynamic(item.label.clone()), cx.edit(id))
+            .back(Text::dynamic(item.label.clone()), cx.edit(item.id))
             .actions(Markup::raw_unchecked(buttons)),
         Markup::raw_unchecked(body),
     )
+}
+
+/// `POST <id>/act/<code>/<part>`: one row of a report tried on its own, as the
+/// table row that replaces the waiting one.
+async fn act_part(cx: &Cx, shell: Shell, id: i64, code: &str, part: &str) -> Response {
+    use crate::action::{ActionCx, State};
+    let db = cx.ctx.db();
+    let item = match store::find(db, id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return failure(e),
+    };
+    let Some(action) = cx.actions_for(&item.kind).find(|a| a.code == code) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(named) = action.action.parts().into_iter().find(|p| p.code == part) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = match store::fields(db, cx.ctx.crypt(), id).await {
+        Ok(fields) => {
+            action
+                .action
+                .part(
+                    &ActionCx {
+                        db,
+                        crypt: cx.ctx.crypt(),
+                        item: &item,
+                        fields: &fields,
+                    },
+                    part,
+                )
+                .await
+        }
+        Err(e) => crate::action::PartResult::new(State::Failed, e.to_string()),
+    };
+    if result.accepted == Some(true) {
+        // The row still shows its result when the standing could not be set.
+        store::reinstate(db, id).await.ok();
+    }
+    // What mends the row sits in it.
+    let mut extra = String::new();
+    for offered in cx
+        .actions_for(&item.kind)
+        .filter(|a| a.code != code && result.offer.contains(&a.code))
+    {
+        extra.push_str(&format!(
+            r#"<div style="margin-top:8px">{}</div>"#,
+            action_button(cx, id, offered)
+                .primary()
+                .small()
+                .render(&shell)
+                .as_str()
+        ));
+    }
+    let html = row(&shell, &named.label, result.state, &result.detail, &extra);
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
 }
 
 async fn delete(cx: &Cx, user: AuthenticatedUser, session: SessionHandle, id: i64) -> Response {

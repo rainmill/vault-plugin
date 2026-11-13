@@ -137,6 +137,26 @@ Answer | Shown
 `ActionReg::unlisted()` keeps a button off the credential's page, for an action
 a report offers.
 
+A report whose rows take a call each fills in row by row:
+
+```rust
+#[async_trait]
+impl Action for TestToken {
+    fn parts(&self) -> Vec<Part> {
+        vec![Part::new("token", t!("API token")), Part::new("quota", t!("Quota"))]
+    }
+
+    async fn part(&self, cx: &ActionCx<'_>, code: &str) -> PartResult {
+        match code {
+            "token" => PartResult::new(State::Works, "Signed in.").accepted(),
+            _ => PartResult::new(State::Failed, "Nothing left this month.").offer("top-up"),
+        }
+    }
+}
+```
+
+`PartResult::offer(code)` puts that action's button in the row.
+
 ## Usage and cost
 
 ```rust

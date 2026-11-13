@@ -64,11 +64,103 @@ impl ActionReg {
     }
 }
 
-/// What a button does.
+/// What a button does: one answer from [`run`](Action::run), or a report
+/// whose rows are tried one by one ([`parts`](Action::parts) and
+/// [`part`](Action::part)), each filling in on the page as it comes back.
 #[async_trait]
 pub trait Action: Send + Sync {
-    /// Acts on the credential and says what came of it.
-    async fn run(&self, cx: &ActionCx<'_>) -> Outcome;
+    /// Acts on the credential and says what came of it. An action with parts
+    /// need not write it: every part is run in turn into one report.
+    async fn run(&self, cx: &ActionCx<'_>) -> Outcome {
+        let mut report = Report {
+            note: self.note(),
+            ..Report::default()
+        };
+        for part in self.parts() {
+            let result = self.part(cx, &part.code).await;
+            if result.accepted.is_some() {
+                report.accepted = result.accepted;
+            }
+            report.offer.extend(result.offer);
+            report.lines.push(Line {
+                label: part.label,
+                state: result.state,
+                detail: result.detail,
+            });
+        }
+        Outcome::Report(report)
+    }
+
+    /// The rows of a report tried one by one, in order. Empty for an action
+    /// that answers at once.
+    fn parts(&self) -> Vec<Part> {
+        Vec::new()
+    }
+
+    /// A sentence above the rows.
+    fn note(&self) -> Option<Text> {
+        None
+    }
+
+    /// Tries the part `code` names.
+    async fn part(&self, _cx: &ActionCx<'_>, _code: &str) -> PartResult {
+        PartResult::new(State::NotTried, "")
+    }
+}
+
+/// One row of a report tried on its own.
+pub struct Part {
+    /// The part's code: letters, digits, `-`, `_`.
+    pub code: String,
+    /// What is tried.
+    pub label: Text,
+}
+
+impl Part {
+    /// A part.
+    pub fn new(code: impl Into<String>, label: impl Into<Text>) -> Self {
+        Self {
+            code: code.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// How one part fared.
+pub struct PartResult {
+    /// How it fared.
+    pub state: State,
+    /// What the provider said.
+    pub detail: String,
+    /// Whether the provider took the credential: `Some(true)` puts a refused
+    /// credential back in good standing.
+    pub accepted: Option<bool>,
+    /// Codes of the kind's actions to offer as buttons in the row.
+    pub offer: Vec<String>,
+}
+
+impl PartResult {
+    /// A result with nothing offered.
+    pub fn new(state: State, detail: impl Into<String>) -> Self {
+        Self {
+            state,
+            detail: detail.into(),
+            accepted: None,
+            offer: Vec::new(),
+        }
+    }
+
+    /// The provider took the credential.
+    pub fn accepted(mut self) -> Self {
+        self.accepted = Some(true);
+        self
+    }
+
+    /// Offers the action `code` names as a button in the row.
+    pub fn offer(mut self, code: impl Into<String>) -> Self {
+        self.offer.push(code.into());
+        self
+    }
 }
 
 /// The credential an action runs on, whatever its standing.
