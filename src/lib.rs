@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use laterite_core::module::BootCx;
 use laterite_core::{CoreResult, Crypt, Db, MigrationSet, Module, ModuleId, Registry};
 
-pub use registry::{KindReg, SlotReg, RESERVED_FIELDS};
+pub use registry::{Category, KindReg, SlotReg, RESERVED_FIELDS};
 pub use store::{Item, ItemInput, Standing};
 
 /// The permission to see and change credentials and what they are used for.

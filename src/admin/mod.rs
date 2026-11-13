@@ -448,18 +448,52 @@ async fn index(cx: &Cx, shell: Shell) -> Response {
         ));
     }
 
-    // One New button a kind.
-    let mut actions = String::new();
-    for (i, kind) in cx.kinds.iter().enumerate() {
-        let label = Text::dynamic(format!("{} {}", shell.t("New"), shell.tt(&kind.label)));
-        let href = cx.ctx.url(&format!("new?kind={}", kind.code));
-        let button = Button::link(label, href);
-        let button = if i == 0 { button.primary() } else { button };
-        actions.push_str(&button.render(&shell).into_string());
-    }
+    let actions = new_menu(cx, &shell);
     shell.page_with(
         PageHead::new(t!("Credentials")).actions(Markup::raw_unchecked(actions)),
         Markup::raw_unchecked(body),
+    )
+}
+
+/// The way to a new credential: one button for the only kind, else one menu
+/// of every kind under its category.
+fn new_menu(cx: &Cx, shell: &Shell) -> String {
+    let href = |kind: &KindReg| cx.ctx.url(&format!("new?kind={}", kind.code));
+    if let [kind] = cx.kinds.as_slice() {
+        let label = Text::dynamic(format!("{} {}", shell.t("New"), shell.tt(&kind.label)));
+        return Button::link(label, href(kind))
+            .primary()
+            .render(shell)
+            .into_string();
+    }
+    let mut kinds: Vec<&KindReg> = cx.kinds.iter().collect();
+    // Stable: kinds of one category keep their registration order.
+    kinds.sort_by_key(|kind| kind.category);
+    let several = kinds
+        .windows(2)
+        .any(|pair| pair[0].category != pair[1].category);
+    let mut panel = String::new();
+    let mut under = None;
+    for kind in kinds {
+        if several && under != Some(kind.category) {
+            if under.is_some() {
+                panel.push_str(r#"<div class="lat-menu__divider"></div>"#);
+            }
+            panel.push_str(&format!(
+                r#"<div style="padding:6px 10px 2px;font-size:var(--fs-11);font-weight:var(--fw-semibold);letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted)">{}</div>"#,
+                escape(&shell.tt(&kind.category.label()))
+            ));
+            under = Some(kind.category);
+        }
+        panel.push_str(&format!(
+            r#"<a href="{}">{}</a>"#,
+            escape(&href(kind)),
+            escape(&shell.tt(&kind.label))
+        ));
+    }
+    format!(
+        r#"<details class="lat-menu"><summary class="lat-btn lat-btn--primary">{} <span aria-hidden="true" style="margin-left:6px">&#9662;</span></summary><div class="lat-menu__panel" style="left:0;right:auto;min-width:220px">{panel}</div></details>"#,
+        escape(&shell.t("New credential"))
     )
 }
 

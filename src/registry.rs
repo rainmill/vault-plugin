@@ -2,7 +2,7 @@
 //! understand, and the slots they need one for.
 
 use laterite_admin::form::FormField;
-use laterite_core::Text;
+use laterite_core::{t, Text};
 
 /// A kind of credential: a code, a name, and the fields one holds.
 ///
@@ -23,17 +23,69 @@ pub struct KindReg {
     /// The fields a credential of this kind holds. A `sensitive` field is a
     /// secret; any other is shown as it is.
     pub fields: Vec<FormField>,
+    /// What the credential is for; kinds are offered under it.
+    pub category: Category,
+}
+
+/// What a kind of credential is for. The Credentials screen offers the kinds
+/// grouped under these, in this order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
+pub enum Category {
+    /// WhatsApp, SMS, push and chat.
+    Messaging,
+    /// Mail delivery.
+    Email,
+    /// Payment processors and payouts.
+    Payments,
+    /// Language and vision models.
+    Ai,
+    /// Scrapers, feeds and third-party data.
+    Data,
+    /// Maps, geocoding and places.
+    Maps,
+    /// Object storage and file hosts.
+    Storage,
+    /// Sign-in providers and identity checks.
+    Identity,
+    /// Anything else.
+    #[default]
+    Other,
+}
+
+impl Category {
+    /// The category's name, as an administrator reads it.
+    pub fn label(self) -> Text {
+        match self {
+            Self::Messaging => t!("Messaging"),
+            Self::Email => t!("Email"),
+            Self::Payments => t!("Payments"),
+            Self::Ai => t!("AI"),
+            Self::Data => t!("Data"),
+            Self::Maps => t!("Maps"),
+            Self::Storage => t!("Storage"),
+            Self::Identity => t!("Sign-in and identity"),
+            Self::Other => t!("Other"),
+        }
+    }
 }
 
 impl KindReg {
-    /// A kind with no fields yet.
+    /// A kind with no fields yet, under [`Category::Other`].
     pub fn new(code: impl Into<String>, label: impl Into<Text>) -> Self {
         Self {
             code: code.into(),
             label: label.into(),
             help: None,
             fields: Vec::new(),
+            category: Category::Other,
         }
+    }
+
+    /// Files the kind under `category`.
+    pub fn category(mut self, category: Category) -> Self {
+        self.category = category;
+        self
     }
 
     /// Adds a field. Its name is a plain identifier and none of
