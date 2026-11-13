@@ -22,6 +22,7 @@ use laterite_admin::{
 };
 use laterite_core::{t, CoreError, CoreResult, Registry, SealedFile, Text};
 
+use crate::action::ActionReg;
 use crate::registry::{KindReg, SlotReg, RESERVED_FIELDS};
 use crate::store::{self, Item, ItemInput, Standing};
 use crate::{MANAGE, REVEAL};
@@ -100,6 +101,35 @@ pub(crate) fn check(registry: &Registry) -> CoreResult<()> {
             ));
         }
     }
+    let actions = registry.items::<ActionReg>();
+    for (i, action) in actions.iter().enumerate() {
+        if !kinds.iter().any(|k| k.code == action.kind) {
+            return fail(format!(
+                "the credential action `{}` is for the kind `{}`, which no module registered",
+                action.code, action.kind
+            ));
+        }
+        let plain = !action.code.is_empty()
+            && action
+                .code
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !plain {
+            return fail(format!(
+                "the credential action `{}` has a code that is not letters, digits, `-` and `_`",
+                action.code
+            ));
+        }
+        if actions[..i]
+            .iter()
+            .any(|a| a.kind == action.kind && a.code == action.code)
+        {
+            return fail(format!(
+                "the credential action `{}` is registered twice for the kind `{}`",
+                action.code, action.kind
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -112,11 +142,17 @@ struct Cx {
     ctx: RouteCtx,
     kinds: Arc<Vec<KindReg>>,
     slots: Arc<Vec<SlotReg>>,
+    actions: Arc<Vec<ActionReg>>,
 }
 
 impl Cx {
     fn kind(&self, code: &str) -> Option<&KindReg> {
         self.kinds.iter().find(|k| k.code == code)
+    }
+
+    /// The buttons modules added for credentials of `kind`.
+    fn actions_for<'a>(&'a self, kind: &'a str) -> impl Iterator<Item = &'a ActionReg> {
+        self.actions.iter().filter(move |a| a.kind == kind)
     }
 
     /// The slots that take credentials of `kind`, in registration order. A
@@ -141,12 +177,26 @@ impl Screen for Credentials {
             ctx: ctx.clone(),
             kinds: Arc::new(registry.items::<KindReg>().into_iter().cloned().collect()),
             slots: Arc::new(registry.items::<SlotReg>().into_iter().cloned().collect()),
+            actions: Arc::new(registry.items::<ActionReg>().into_iter().cloned().collect()),
         };
         let c = |cx: &Cx| cx.clone();
         let (index_cx, new_cx, create_cx, edit_cx, update_cx, delete_cx, reveal_cx) =
             (c(&cx), c(&cx), c(&cx), c(&cx), c(&cx), c(&cx), c(&cx));
         let (usage_home_cx, usage_cx, rates_cx) = (c(&cx), c(&cx), c(&cx));
+        let act_cx = c(&cx);
         Router::new()
+            .route(
+                "/{id}/act/{code}",
+                post(
+                    move |Path((id, code)): Path<(i64, String)>,
+                          Extension(shell): Extension<Shell>,
+                          Extension(user): Extension<AuthenticatedUser>,
+                          Extension(session): Extension<SessionHandle>| {
+                        let cx = act_cx.clone();
+                        async move { act(&cx, shell, user, session, id, &code).await }
+                    },
+                ),
+            )
             .route(
                 "/usage",
                 get(move || {
@@ -624,14 +674,21 @@ async fn form_page(
         .back(t!("Credentials"), cx.index())
         .assets(&form.assets());
     if let Some(item) = &item {
-        head = head.actions(
+        // The buttons other modules add for this kind, then the page's own.
+        let mut buttons = String::new();
+        for action in cx.actions_for(&item.kind).filter(|a| a.listed) {
+            buttons.push_str(action_button(cx, item.id, action).render(&shell).as_str());
+        }
+        buttons.push_str(
             Button::post(t!("Delete"), cx.ctx.url(&format!("{}/delete", item.id)))
                 .danger()
                 .confirm(t!(
                     "Delete this credential? Whatever uses it stops being able to."
                 ))
-                .render(&shell),
+                .render(&shell)
+                .as_str(),
         );
+        head = head.actions(Markup::raw_unchecked(buttons));
     }
     shell.page_with(head, Markup::raw_unchecked(body))
 }
@@ -900,6 +957,126 @@ async fn save(
         .await;
     session.push_flash(FlashLevel::Success, t!("The credential was saved."));
     Redirect::to(&cx.index()).into_response()
+}
+
+/// The button that runs `action` on credential `id`.
+fn action_button(cx: &Cx, id: i64, action: &ActionReg) -> Button {
+    let button = Button::post(
+        action.label.clone(),
+        cx.ctx.url(&format!("{id}/act/{}", action.code)),
+    );
+    match &action.icon {
+        Some(icon) => button.icon(icon.clone()),
+        None => button,
+    }
+}
+
+/// `POST <id>/act/<code>`: runs a module's action on the credential, then
+/// says what came of it on the credential's page, or shows its report.
+async fn act(
+    cx: &Cx,
+    shell: Shell,
+    user: AuthenticatedUser,
+    session: SessionHandle,
+    id: i64,
+    code: &str,
+) -> Response {
+    use crate::action::{ActionCx, Outcome, State};
+    let db = cx.ctx.db();
+    let item = match store::find(db, id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return failure(e),
+    };
+    let Some(action) = cx.actions_for(&item.kind).find(|a| a.code == code) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let fields = match store::fields(db, cx.ctx.crypt(), id).await {
+        Ok(fields) => fields,
+        Err(e) => return failure(e),
+    };
+    let outcome = action
+        .action
+        .run(&ActionCx {
+            db,
+            crypt: cx.ctx.crypt(),
+            item: &item,
+            fields: &fields,
+        })
+        .await;
+    cx.ctx
+        .audit(
+            &user,
+            "rainmill.vault.credential.action",
+            Some("vault_items"),
+            Some(&id.to_string()),
+            Some(&item.label),
+            Some(code),
+        )
+        .await;
+    let report = match outcome {
+        Outcome::Done(message) => {
+            session.push_flash(FlashLevel::Success, message);
+            return Redirect::to(&cx.edit(id)).into_response();
+        }
+        Outcome::Failed(message) => {
+            session.push_flash(FlashLevel::Error, message);
+            return Redirect::to(&cx.edit(id)).into_response();
+        }
+        Outcome::Report(report) => report,
+    };
+    if report.accepted == Some(true) {
+        if let Err(e) = store::reinstate(db, id).await {
+            return failure(e);
+        }
+    }
+    let mut rows = String::new();
+    for line in &report.lines {
+        let (tone, word) = match line.state {
+            State::Works => ("ok", t!("Works")),
+            State::Failed => ("bad", t!("Failed")),
+            State::NotTried => ("wait", t!("Not tried")),
+        };
+        rows.push_str(&format!(
+            r#"<tr><td><strong>{}</strong></td><td><span class="lat-badge" data-tone="{tone}">{}</span></td><td>{}</td></tr>"#,
+            escape(&shell.tt(&line.label)),
+            escape(&shell.tt(&word)),
+            escape(&line.detail),
+        ));
+    }
+    let mut body = String::new();
+    if let Some(note) = &report.note {
+        body.push_str(&format!(
+            r#"<p class="lat-note">{}</p>"#,
+            escape(&shell.tt(note))
+        ));
+    }
+    body.push_str(&format!(
+        r#"<div class="lat-tablewrap"><table class="lat-table"><thead><tr><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+        escape(&shell.t("Part")),
+        escape(&shell.t("Result")),
+        escape(&shell.t("Detail")),
+    ));
+    // Run again, then whatever the report offers.
+    let mut buttons = action_button(cx, id, action).render(&shell).into_string();
+    for offered in cx
+        .actions_for(&item.kind)
+        .filter(|a| a.code != code && report.offer.contains(&a.code))
+    {
+        buttons.push_str(
+            action_button(cx, id, offered)
+                .primary()
+                .render(&shell)
+                .as_str(),
+        );
+    }
+    let title = Text::dynamic(format!("{}: {}", shell.tt(&action.label), item.label));
+    shell.page_with(
+        PageHead::new(title)
+            .back(Text::dynamic(item.label.clone()), cx.edit(id))
+            .actions(Markup::raw_unchecked(buttons)),
+        Markup::raw_unchecked(body),
+    )
 }
 
 async fn delete(cx: &Cx, user: AuthenticatedUser, session: SessionHandle, id: i64) -> Response {

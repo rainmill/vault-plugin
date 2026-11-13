@@ -21,6 +21,7 @@
 //! governance, not isolation: a module compiled into the application shares
 //! its process.
 
+pub mod action;
 mod admin;
 pub mod migrations;
 mod registry;
@@ -32,6 +33,7 @@ use std::collections::BTreeMap;
 use laterite_core::module::BootCx;
 use laterite_core::{CoreResult, Crypt, Db, MigrationSet, Module, ModuleId, Registry};
 
+pub use action::ActionReg;
 pub use registry::{Category, KindReg, SlotReg, RESERVED_FIELDS};
 pub use store::{Item, ItemInput, Standing};
 
@@ -162,26 +164,6 @@ impl Lease {
 /// expired.
 pub async fn lease(db: &Db, crypt: &Crypt, slot: &str) -> Result<Lease, VaultError> {
     let (item, fields) = store::take(db, crypt, slot).await?;
-    Ok(Lease {
-        db: db.clone(),
-        slot: slot.to_string(),
-        item,
-        fields,
-    })
-}
-
-/// Hands out the first credential attached to `slot` whatever its standing,
-/// for a test of the credential itself. [`used`](Lease::used) puts it back in
-/// good standing; dropping the lease unreported leaves it as it was.
-///
-/// [`VaultError::Unbound`] when nothing is attached.
-pub async fn inspect(db: &Db, crypt: &Crypt, slot: &str) -> Result<Lease, VaultError> {
-    let item = store::items_of(db, slot)
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| VaultError::Unbound(slot.to_string()))?;
-    let fields = store::fields(db, crypt, item.id).await?;
     Ok(Lease {
         db: db.clone(),
         slot: slot.to_string(),

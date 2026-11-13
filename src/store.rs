@@ -549,6 +549,22 @@ pub(crate) async fn spent(
     count(db, item_id, slot, meter, 1, 0, units).await
 }
 
+/// Puts an item a provider refused back in good standing.
+pub(crate) async fn reinstate(db: &Db, item_id: i64) -> Result<(), VaultError> {
+    let (sql, values) = build(
+        db.backend,
+        Query::update()
+            .table(Items::Table)
+            .value(Items::State, "ok")
+            .and_where(Expr::col(Items::Id).eq(item_id))
+            .to_owned(),
+    );
+    bind_values(sqlx::query(&sql), values)
+        .execute(&db.pool)
+        .await?;
+    Ok(())
+}
+
 /// Records a failed use. A refusal (the provider would not take the
 /// credential) puts the item out of the cycle for a while.
 pub(crate) async fn failed(

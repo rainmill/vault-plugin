@@ -88,6 +88,55 @@ match call(token).await {
 | `VaultError::Unbound` | Nothing is attached to the slot. |
 | `VaultError::NoneUsable` | Everything attached is refused, expired or at its allowance; the error names each. |
 
+## Add a button to a credential's page
+
+```rust
+use std::sync::Arc;
+use rainmill_vault::action::{Action, ActionCx, Line, Outcome, Report, State};
+use rainmill_vault::ActionReg;
+
+struct TestToken;
+
+#[async_trait]
+impl Action for TestToken {
+    async fn run(&self, cx: &ActionCx<'_>) -> Outcome {
+        let token = cx.field("token").unwrap_or_default();
+        match acme::ping(token).await {
+            Ok(account) => Outcome::Report(Report {
+                lines: vec![Line {
+                    label: t!("API token"),
+                    state: State::Works,
+                    detail: format!("Signed in as {account}."),
+                }],
+                accepted: Some(true),
+                ..Report::default()
+            }),
+            Err(e) => Outcome::Failed(Text::dynamic(e.to_string())),
+        }
+    }
+}
+
+registry.add(
+    ActionReg::new("acme.token", "test", t!("Test connection"), Arc::new(TestToken)).icon("plug"),
+);
+```
+
+Answer | Shown
+--- | ---
+`Outcome::Done(text)` | A success message on the credential's page.
+`Outcome::Failed(text)` | An error message on the credential's page.
+`Outcome::Report(report)` | A page with one row a `Line`.
+
+`Report` field | Effect
+--- | ---
+`note` | A sentence above the rows.
+`lines` | The rows: `State::Works`, `Failed` or `NotTried`, with a detail.
+`accepted` | `Some(true)` puts a refused credential back in good standing.
+`offer` | Codes of the kind's other actions, shown as buttons on the report.
+
+`ActionReg::unlisted()` keeps a button off the credential's page, for an action
+a report offers.
+
 ## Usage and cost
 
 ```rust
