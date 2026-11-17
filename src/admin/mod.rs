@@ -23,8 +23,8 @@ use laterite_admin::{
 use laterite_core::{t, CoreError, CoreResult, Registry, SealedFile, Text};
 
 use crate::action::ActionReg;
-use crate::registry::{KindReg, SlotReg, RESERVED_FIELDS};
-use crate::store::{self, Item, ItemInput, Standing};
+use crate::registry::{KindReg, ScopeReg, SlotReg, RESERVED_FIELDS};
+use crate::store::{self, Item, ItemInput, Scope, Standing};
 use crate::{MANAGE, REVEAL};
 
 const SECTION: &str = "rainmill.vault";
@@ -143,9 +143,35 @@ struct Cx {
     kinds: Arc<Vec<KindReg>>,
     slots: Arc<Vec<SlotReg>>,
     actions: Arc<Vec<ActionReg>>,
+    scopes: Arc<Vec<ScopeReg>>,
+}
+
+/// A record a credential may belong to, as the screens offer it.
+struct Belonging {
+    scope: Scope,
+    /// `App: Acme`.
+    name: String,
 }
 
 impl Cx {
+    /// Every record of every registered scope. A scope whose table cannot be
+    /// read offers nothing.
+    async fn belongings(&self, shell: &Shell) -> Vec<Belonging> {
+        let mut out = Vec::new();
+        for reg in self.scopes.iter() {
+            let records = store::scope_records(self.ctx.db(), &reg.table, &reg.name_column)
+                .await
+                .unwrap_or_default();
+            for (id, name) in records {
+                out.push(Belonging {
+                    scope: Scope::new(reg.code.clone(), id),
+                    name: format!("{}: {name}", shell.tt(&reg.label)),
+                });
+            }
+        }
+        out
+    }
+
     fn kind(&self, code: &str) -> Option<&KindReg> {
         self.kinds.iter().find(|k| k.code == code)
     }
@@ -178,6 +204,7 @@ impl Screen for Credentials {
             kinds: Arc::new(registry.items::<KindReg>().into_iter().cloned().collect()),
             slots: Arc::new(registry.items::<SlotReg>().into_iter().cloned().collect()),
             actions: Arc::new(registry.items::<ActionReg>().into_iter().cloned().collect()),
+            scopes: Arc::new(registry.items::<ScopeReg>().into_iter().cloned().collect()),
         };
         let c = |cx: &Cx| cx.clone();
         let (index_cx, new_cx, create_cx, edit_cx, update_cx, delete_cx, reveal_cx) =
@@ -247,10 +274,13 @@ impl Screen for Credentials {
             )
             .route(
                 "/",
-                get(move |Extension(shell): Extension<Shell>| {
-                    let cx = index_cx.clone();
-                    async move { index(&cx, shell).await }
-                }),
+                get(
+                    move |Query(q): Query<HashMap<String, String>>,
+                          Extension(shell): Extension<Shell>| {
+                        let cx = index_cx.clone();
+                        async move { index(&cx, shell, q.get("scope").map(String::as_str)).await }
+                    },
+                ),
             )
             .route(
                 "/new",
@@ -370,13 +400,58 @@ fn spent_text(item: &Item, shell: &Shell) -> String {
 }
 
 /// The list of credentials, then every slot and what is attached to it.
-async fn index(cx: &Cx, shell: Shell) -> Response {
+async fn index(cx: &Cx, shell: Shell, wanted: Option<&str>) -> Response {
     let db = cx.ctx.db();
-    let items = match store::list(db).await {
+    let mut items = match store::list(db).await {
         Ok(items) => items,
         Err(e) => return failure(e),
     };
+    let belongings = cx.belongings(&shell).await;
+    let scopes = store::scopes(db).await.unwrap_or_default();
     let mut body = String::new();
+
+    // Which credentials: every one, the global ones, or one record's.
+    let wanted = wanted.unwrap_or_default();
+    if !belongings.is_empty() {
+        let mut chips = String::new();
+        let mut chip = |key: &str, label: &str| {
+            chips.push_str(&format!(
+                "<a class=\"lat-btn {}\" href=\"{}\">{}</a> ",
+                if key == wanted {
+                    "lat-btn--primary"
+                } else {
+                    "lat-btn--ghost"
+                },
+                escape(&if key.is_empty() {
+                    cx.index()
+                } else {
+                    format!("{}?scope={key}", cx.index())
+                }),
+                escape(label)
+            ));
+        };
+        chip("", &shell.t("All"));
+        chip("global", &shell.t("Global"));
+        for b in &belongings {
+            chip(&b.scope.key(), &b.name);
+        }
+        body.push_str(&format!("<p style=\"margin:0 0 16px\">{chips}</p>"));
+        match wanted {
+            "" => {}
+            "global" => items.retain(|i| !scopes.contains_key(&i.id)),
+            key => items.retain(|i| scopes.get(&i.id).is_some_and(|s| s.key() == key)),
+        }
+    }
+    let belongs = |item: &Item| -> String {
+        match scopes.get(&item.id) {
+            None => shell.t("Global"),
+            Some(scope) => belongings
+                .iter()
+                .find(|b| &b.scope == scope)
+                .map(|b| b.name.clone())
+                .unwrap_or_else(|| scope.key()),
+        }
+    };
 
     // Credentials.
     if items.is_empty() {
@@ -415,10 +490,15 @@ async fn index(cx: &Cx, shell: Shell) -> Response {
                 }
             }
             rows.push_str(&format!(
-                "<tr><td><a href=\"{}\"><strong>{}</strong></a></td><td>{}</td><td>{state}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td><a href=\"{}\"><strong>{}</strong></a></td><td>{}</td>{}<td>{state}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape(&cx.edit(item.id)),
                 escape(&item.label),
                 escape(&kind),
+                if belongings.is_empty() {
+                    String::new()
+                } else {
+                    format!("<td>{}</td>", escape(&belongs(item)))
+                },
                 escape(&spent_text(item, &shell)),
                 item.last_used_at
                     .as_deref()
@@ -432,9 +512,14 @@ async fn index(cx: &Cx, shell: Shell) -> Response {
             ));
         }
         body.push_str(&format!(
-            "<div class=\"lat-tablewrap\"><table class=\"lat-table\"><thead><tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>",
+            "<div class=\"lat-tablewrap\"><table class=\"lat-table\"><thead><tr><th>{}</th><th>{}</th>{}<th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>{rows}</tbody></table></div>",
             escape(&shell.t("Label")),
             escape(&shell.t("Kind")),
+            if belongings.is_empty() {
+                String::new()
+            } else {
+                format!("<th>{}</th>", escape(&shell.t("Belongs to")))
+            },
             escape(&shell.t("State")),
             escape(&shell.t("Used this period")),
             escape(&shell.t("Last used")),
@@ -558,12 +643,27 @@ fn new_menu(cx: &Cx, shell: &Shell) -> String {
 }
 
 /// The form's own fields around a kind's, with a switch per slot of the kind.
-fn form_fields(cx: &Cx, kind: &KindReg) -> Vec<FormField> {
+fn form_fields(cx: &Cx, kind: &KindReg, belongings: &[Belonging]) -> Vec<FormField> {
     let mut fields = vec![FormField::text("label", t!("Label"))
         .required()
         .help(t!(
             "A name to tell this credential from the others. Shown in lists and logs; never put the secret here."
         ))];
+    if !belongings.is_empty() {
+        let mut options = vec![serde_json::json!({ "value": "", "label": "Global" })];
+        options.extend(
+            belongings
+                .iter()
+                .map(|b| serde_json::json!({ "value": b.scope.key(), "label": b.name })),
+        );
+        fields.push(
+            FormField::of("scope", t!("Belongs to"), "select")
+                .options(serde_json::json!({ "options": options }))
+                .help(t!(
+                    "Global serves everything. One that belongs to a record serves that record alone, ahead of the global one."
+                )),
+        );
+    }
     fields.extend(kind.fields.iter().cloned());
     fields.push(
         FormField::of("allowance", t!("Allowance a period"), "text")
@@ -622,7 +722,8 @@ async fn form_page(
     let Some(kind) = cx.kind(kind_code) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let fields = form_fields(cx, kind);
+    let belongings = cx.belongings(&shell).await;
+    let fields = form_fields(cx, kind, &belongings);
     let form = match cx.ctx.value_form(&fields, "rainmill.vault") {
         Ok(form) => form,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, shell.tt(&e)).into_response(),
@@ -723,6 +824,14 @@ async fn stored_view(
             .into(),
     );
     view.insert("period_day".into(), item.period_day.to_string().into());
+    view.insert(
+        "scope".into(),
+        store::scope_of(db, item.id)
+            .await?
+            .map(|s| s.key())
+            .unwrap_or_default()
+            .into(),
+    );
     for field in &kind.fields {
         let value = fields.get(&field.name).cloned().unwrap_or_default();
         let shown = match secret(field) {
@@ -798,7 +907,8 @@ async fn save(
     };
     let db = cx.ctx.db();
     let crypt = cx.ctx.crypt();
-    let fields = form_fields(cx, kind);
+    let belongings = cx.belongings(&shell).await;
+    let fields = form_fields(cx, kind, &belongings);
     let form = match cx.ctx.value_form(&fields, "rainmill.vault") {
         Ok(form) => form,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, shell.tt(&e)).into_response(),
@@ -921,6 +1031,34 @@ async fn save(
         },
     };
 
+    // What it belongs to, before the slots: a slot holds one credential for
+    // each record, so attaching reads this.
+    let mut moved = false;
+    if !belongings.is_empty() {
+        let chosen = text("scope");
+        let scope = belongings
+            .iter()
+            .find(|b| b.scope.key() == chosen)
+            .map(|b| b.scope.clone());
+        let before = store::scope_of(db, id).await.unwrap_or_default();
+        if before != scope {
+            if let Err(e) = store::set_scope(db, id, scope.as_ref()).await {
+                return failure(e);
+            }
+            moved = true;
+            cx.ctx
+                .audit(
+                    &user,
+                    "rainmill.vault.credential.scope",
+                    Some("vault_items"),
+                    Some(&id.to_string()),
+                    Some(&label),
+                    Some(&scope.map(|s| s.key()).unwrap_or_else(|| "global".into())),
+                )
+                .await;
+        }
+    }
+
     // Attach and detach as the switches say; each change is on the audit log.
     let attached = store::slots_of(db, id).await.unwrap_or_default();
     for (i, slot) in cx.slots_for(&kind.code).into_iter().enumerate() {
@@ -930,7 +1068,7 @@ async fn save(
                     .is_some_and(|s| !s.is_empty() && s != "0" && s != "false")
         });
         let has = attached.contains(&slot.code);
-        let change = if wanted && !has {
+        let change = if wanted && (!has || moved) {
             store::bind(db, &slot.code, id, slot.pooled)
                 .await
                 .map(|()| "attach")

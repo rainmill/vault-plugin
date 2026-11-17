@@ -5,7 +5,7 @@
 //! `lat crypt rotate` re-seals the column like any other.
 
 use laterite_core::serde_json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{Datelike, NaiveDate, SecondsFormat, Utc};
 use laterite_core::crypt::FIELD_PURPOSE;
@@ -16,7 +16,8 @@ use laterite_core::{AnyRowExt, Crypt, Db};
 use sea_query::{Expr, Iden, Order, Query};
 
 use crate::schema::{
-    VaultBindings as Bindings, VaultItems as Items, VaultRates as Rates, VaultUsage as Usage,
+    VaultBindings as Bindings, VaultItemScopes as Scopes, VaultItems as Items, VaultRates as Rates,
+    VaultUsage as Usage,
 };
 use crate::VaultError;
 
@@ -264,6 +265,13 @@ pub async fn delete(db: &Db, id: i64) -> Result<(), VaultError> {
         build(
             db.backend,
             Query::delete()
+                .from_table(Scopes::Table)
+                .and_where(Expr::col(Scopes::ItemId).eq(id))
+                .to_owned(),
+        ),
+        build(
+            db.backend,
+            Query::delete()
                 .from_table(Bindings::Table)
                 .and_where(Expr::col(Bindings::ItemId).eq(id))
                 .to_owned(),
@@ -395,12 +403,155 @@ pub async fn slots_of(db: &Db, item_id: i64) -> Result<Vec<String>, VaultError> 
 
 /// The items attached to a slot, in their order.
 pub async fn items_of(db: &Db, slot: &str) -> Result<Vec<Item>, VaultError> {
-    Ok(bound(db, slot).await?.into_iter().map(|(_, i)| i).collect())
+    Ok(bound(db, slot, Within::Any)
+        .await?
+        .into_iter()
+        .map(|(_, i)| i)
+        .collect())
+}
+
+/// What an item belongs to: a record of a registered scope. An item with none
+/// is global.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Scope {
+    /// The registered scope's code.
+    pub kind: String,
+    /// The id of the record.
+    pub id: i64,
+}
+
+impl Scope {
+    /// The record `id` of the scope `kind`.
+    pub fn new(kind: impl Into<String>, id: i64) -> Self {
+        Self {
+            kind: kind.into(),
+            id,
+        }
+    }
+
+    /// A scope from its `kind:id` form.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (kind, id) = text.rsplit_once(':')?;
+        (!kind.is_empty()).then_some(())?;
+        Some(Self::new(kind, id.parse().ok()?))
+    }
+
+    /// The `kind:id` form.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.kind, self.id)
+    }
+}
+
+/// Which of a slot's items a read takes.
+#[derive(Clone, Copy)]
+enum Within<'a> {
+    /// Every item, whatever it belongs to.
+    Any,
+    /// Global items alone.
+    Global,
+    /// The items of one scope.
+    Of(&'a Scope),
+}
+
+/// What an item belongs to, or `None` for a global item.
+pub async fn scope_of(db: &Db, item_id: i64) -> Result<Option<Scope>, VaultError> {
+    let (sql, values) = build(
+        db.backend,
+        Query::select()
+            .columns([Scopes::ScopeType, Scopes::ScopeId])
+            .from(Scopes::Table)
+            .and_where(Expr::col(Scopes::ItemId).eq(item_id))
+            .to_owned(),
+    );
+    let row = bind_values(sqlx::query(&sql), values)
+        .fetch_optional(&db.pool)
+        .await?;
+    Ok(match row {
+        Some(row) => Some(Scope::new(
+            row.get_text("scope_type")?,
+            row.get_int("scope_id")?,
+        )),
+        None => None,
+    })
+}
+
+/// Every scoped item's scope, by item id. An item missing here is global.
+pub async fn scopes(db: &Db) -> Result<HashMap<i64, Scope>, VaultError> {
+    let (sql, values) = build(
+        db.backend,
+        Query::select()
+            .columns([Scopes::ItemId, Scopes::ScopeType, Scopes::ScopeId])
+            .from(Scopes::Table)
+            .to_owned(),
+    );
+    let rows = bind_values(sqlx::query(&sql), values)
+        .fetch_all(&db.pool)
+        .await?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in &rows {
+        out.insert(
+            row.get_int("item_id")?,
+            Scope::new(row.get_text("scope_type")?, row.get_int("scope_id")?),
+        );
+    }
+    Ok(out)
+}
+
+/// The records of a scope as `(id, name)`, by name.
+pub async fn scope_records(
+    db: &Db,
+    table: &str,
+    name_column: &str,
+) -> Result<Vec<(i64, String)>, VaultError> {
+    use sea_query::Alias;
+    let (sql, values) = build(
+        db.backend,
+        Query::select()
+            .expr_as(Expr::col(Alias::new("id")), Alias::new("id"))
+            .expr_as(Expr::col(Alias::new(name_column)), Alias::new("name"))
+            .from(Alias::new(table))
+            .order_by(Alias::new(name_column), Order::Asc)
+            .to_owned(),
+    );
+    let rows = bind_values(sqlx::query(&sql), values)
+        .fetch_all(&db.pool)
+        .await?;
+    rows.iter()
+        .map(|row| Ok((row.get_int("id")?, row.get_text("name")?)))
+        .collect()
+}
+
+/// Says what an item belongs to; `None` makes it global.
+pub async fn set_scope(db: &Db, item_id: i64, scope: Option<&Scope>) -> Result<(), VaultError> {
+    // Built first: a statement builder must not live across an await.
+    let clear = build(
+        db.backend,
+        Query::delete()
+            .from_table(Scopes::Table)
+            .and_where(Expr::col(Scopes::ItemId).eq(item_id))
+            .to_owned(),
+    );
+    let set = scope.map(|scope| {
+        build(
+            db.backend,
+            Query::insert()
+                .into_table(Scopes::Table)
+                .columns([Scopes::ItemId, Scopes::ScopeType, Scopes::ScopeId])
+                .values_panic([item_id.into(), scope.kind.as_str().into(), scope.id.into()])
+                .to_owned(),
+        )
+    });
+    for (sql, values) in std::iter::once(clear).chain(set) {
+        bind_values(sqlx::query(&sql), values)
+            .execute(&db.pool)
+            .await?;
+    }
+    Ok(())
 }
 
 /// A slot's bindings as `(binding id, item)`, the one handed out longest ago
 /// first, then in their order.
-async fn bound(db: &Db, slot: &str) -> Result<Vec<(i64, Item)>, VaultError> {
+async fn bound(db: &Db, slot: &str, within: Within<'_>) -> Result<Vec<(i64, Item)>, VaultError> {
     // Scoped: a statement builder must not live across an await.
     let (sql, values) = {
         let mut select = Query::select();
@@ -412,7 +563,27 @@ async fn bound(db: &Db, slot: &str) -> Result<Vec<(i64, Item)>, VaultError> {
                 Expr::col((Items::Table, Items::Id)).equals((Bindings::Table, Bindings::ItemId)),
             )
             .and_where(Expr::col((Bindings::Table, Bindings::Slot)).eq(slot))
-            .order_by((Bindings::Table, Bindings::LeasedAt), Order::Asc)
+            .order_by((Bindings::Table, Bindings::LeasedAt), Order::Asc);
+        if !matches!(within, Within::Any) {
+            select.left_join(
+                Scopes::Table,
+                Expr::col((Scopes::Table, Scopes::ItemId)).equals((Items::Table, Items::Id)),
+            );
+        }
+        match within {
+            Within::Any => {}
+            Within::Global => {
+                select.and_where(Expr::col((Scopes::Table, Scopes::Id)).is_null());
+            }
+            Within::Of(scope) => {
+                select
+                    .and_where(
+                        Expr::col((Scopes::Table, Scopes::ScopeType)).eq(scope.kind.as_str()),
+                    )
+                    .and_where(Expr::col((Scopes::Table, Scopes::ScopeId)).eq(scope.id));
+            }
+        }
+        select
             .order_by((Bindings::Table, Bindings::Position), Order::Asc)
             .order_by((Bindings::Table, Bindings::Id), Order::Asc);
         for column in ITEM_COLUMNS {
@@ -438,19 +609,17 @@ struct BindingId;
 /// credential (`pooled` false) it replaces whatever was attached.
 pub async fn bind(db: &Db, slot: &str, item_id: i64, pooled: bool) -> Result<(), VaultError> {
     if !pooled {
-        let (sql, values) = build(
-            db.backend,
-            Query::delete()
-                .from_table(Bindings::Table)
-                .and_where(Expr::col(Bindings::Slot).eq(slot))
-                .and_where(Expr::col(Bindings::ItemId).ne(item_id))
-                .to_owned(),
-        );
-        bind_values(sqlx::query(&sql), values)
-            .execute(&db.pool)
-            .await?;
+        // One credential for the slot in each scope: the app's own beside the
+        // global one.
+        let scope = scope_of(db, item_id).await?;
+        let within = scope.as_ref().map_or(Within::Global, Within::Of);
+        for (_, other) in bound(db, slot, within).await? {
+            if other.id != item_id {
+                unbind(db, slot, other.id).await?;
+            }
+        }
     }
-    let position = i64::try_from(bound(db, slot).await?.len()).unwrap_or(0);
+    let position = i64::try_from(bound(db, slot, Within::Any).await?.len()).unwrap_or(0);
     let (sql, values) = build(
         db.backend,
         Query::insert()
@@ -489,12 +658,24 @@ pub async fn unbind(db: &Db, slot: &str, item_id: i64) -> Result<(), VaultError>
 
 /// The next credential of `slot` the cycle may hand out, with its fields
 /// opened, and marks it handed out now.
+///
+/// With a `scope`, the credentials that belong to it are the ones cycled, and
+/// the global ones when it has none. Without, the global ones alone.
 pub(crate) async fn take(
     db: &Db,
     crypt: &Crypt,
     slot: &str,
+    scope: Option<&Scope>,
 ) -> Result<(Item, BTreeMap<String, String>), VaultError> {
-    let bound = bound(db, slot).await?;
+    let own = match scope {
+        Some(scope) => bound(db, slot, Within::Of(scope)).await?,
+        None => Vec::new(),
+    };
+    let bound = if own.is_empty() {
+        bound(db, slot, Within::Global).await?
+    } else {
+        own
+    };
     if bound.is_empty() {
         return Err(VaultError::Unbound(slot.to_string()));
     }

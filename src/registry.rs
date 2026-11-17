@@ -103,7 +103,7 @@ impl KindReg {
 }
 
 /// Names the credential form uses itself; a kind's field cannot take one.
-pub const RESERVED_FIELDS: &[&str] = &["label", "allowance", "period_day", "expires_at"];
+pub const RESERVED_FIELDS: &[&str] = &["label", "allowance", "period_day", "expires_at", "scope"];
 
 /// A module's need for a credential of a kind.
 ///
@@ -179,5 +179,45 @@ impl SlotReg {
     pub fn meter(mut self, code: impl Into<String>, label: impl Into<Text>) -> Self {
         self.meters.push((code.into(), label.into()));
         self
+    }
+}
+
+/// Something a credential may belong to: an app, a site, a project. A
+/// credential that belongs to nothing is global.
+///
+/// ```ignore
+/// registry.add(ScopeReg::table("acme.shop", t!("Shop"), "shops", "name"));
+/// ```
+///
+/// The module that owns the records registers the scope; the vault lists the
+/// records, filters credentials by them, and hands a module leasing with
+/// [`lease_for`](crate::lease_for) the record's own credential first.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct ScopeReg {
+    /// The scope's dotted code, stored with each credential that has one.
+    pub code: String,
+    /// What one record is called, as an administrator reads it (`App`).
+    pub label: Text,
+    /// The table holding the records, with an `id` column.
+    pub table: String,
+    /// The column a record is named by.
+    pub name_column: String,
+}
+
+impl ScopeReg {
+    /// A scope over the rows of `table`, each named by `name_column`.
+    pub fn table(
+        code: impl Into<String>,
+        label: impl Into<Text>,
+        table: impl Into<String>,
+        name_column: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: code.into(),
+            label: label.into(),
+            table: table.into(),
+            name_column: name_column.into(),
+        }
     }
 }

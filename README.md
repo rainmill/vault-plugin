@@ -88,6 +88,23 @@ match call(token).await {
 | `VaultError::Unbound` | Nothing is attached to the slot. |
 | `VaultError::NoneUsable` | Everything attached is refused, expired or at its allowance; the error names each. |
 
+## Credentials that belong to a record
+
+```rust
+registry.add(ScopeReg::table("acme.shop", t!("Shop"), "shops", "name"));
+```
+
+```rust
+let lease = rainmill_vault::lease_for(db, crypt, "acme.stock.api", &Scope::new("acme.shop", shop_id)).await?;
+```
+
+| Credential | Serves |
+| --- | --- |
+| Global (belongs to nothing) | `lease`, and `lease_for` a record with none of its own |
+| Belongs to a record | `lease_for` that record alone |
+
+A slot that takes one credential holds one for each record beside the global one. The Credentials screen filters by All, Global or one record, and the form's "Belongs to" sets it.
+
 ## Add a button to a credential's page
 
 ```rust

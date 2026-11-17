@@ -34,8 +34,8 @@ use laterite_core::module::BootCx;
 use laterite_core::{CoreResult, Crypt, Db, MigrationSet, Module, ModuleId, Registry};
 
 pub use action::ActionReg;
-pub use registry::{Category, KindReg, SlotReg, RESERVED_FIELDS};
-pub use store::{Item, ItemInput, Standing};
+pub use registry::{Category, KindReg, ScopeReg, SlotReg, RESERVED_FIELDS};
+pub use store::{Item, ItemInput, Scope, Standing};
 
 /// The permission to see and change credentials and what they are used for.
 pub const MANAGE: &str = "rainmill.vault.manage";
@@ -163,7 +163,27 @@ impl Lease {
 /// [`VaultError::NoneUsable`] when everything attached is failing, spent or
 /// expired.
 pub async fn lease(db: &Db, crypt: &Crypt, slot: &str) -> Result<Lease, VaultError> {
-    let (item, fields) = store::take(db, crypt, slot).await?;
+    lease_in(db, crypt, slot, None).await
+}
+
+/// Like [`lease`], for one record of a scope (an app, say): its own
+/// credentials are the ones used, and the global ones when it has none.
+pub async fn lease_for(
+    db: &Db,
+    crypt: &Crypt,
+    slot: &str,
+    scope: &Scope,
+) -> Result<Lease, VaultError> {
+    lease_in(db, crypt, slot, Some(scope)).await
+}
+
+async fn lease_in(
+    db: &Db,
+    crypt: &Crypt,
+    slot: &str,
+    scope: Option<&Scope>,
+) -> Result<Lease, VaultError> {
+    let (item, fields) = store::take(db, crypt, slot, scope).await?;
     Ok(Lease {
         db: db.clone(),
         slot: slot.to_string(),

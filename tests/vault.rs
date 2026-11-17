@@ -6,7 +6,7 @@ use laterite_core::query::{bind_values, build};
 use laterite_core::sea_query::{Alias, Expr, Query};
 use laterite_core::testing::connect_test;
 use laterite_core::{sqlx, Crypt, Db};
-use rainmill_vault::{lease, store, ItemInput, Standing, VaultError};
+use rainmill_vault::{lease, lease_for, store, ItemInput, Scope, Standing, VaultError};
 
 const SLOT: &str = "acme.stock.api";
 
@@ -218,4 +218,95 @@ async fn a_slot_for_one_credential_keeps_the_last_attached() {
     assert_eq!(store::slots_of(&db, b).await.unwrap(), ["acme.single"]);
     store::unbind(&db, "acme.single", b).await.unwrap();
     assert!(store::slots_of(&db, b).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_record_uses_its_own_credential_and_the_global_one_when_it_has_none() {
+    let (db, _guard) = test_db().await;
+    let crypt = Crypt::ephemeral();
+    let mut ids = Vec::new();
+    for (label, value) in [
+        ("Global", "tg"),
+        ("Shop one", "t1"),
+        ("Shop one, newer", "t1b"),
+    ] {
+        ids.push(
+            store::create(&db, &crypt, "acme.token", &token(label, value, None))
+                .await
+                .unwrap(),
+        );
+    }
+    let (one, two) = (Scope::new("acme.shop", 1), Scope::new("acme.shop", 2));
+    assert_eq!(Scope::parse(&one.key()), Some(one.clone()));
+    store::set_scope(&db, ids[1], Some(&one)).await.unwrap();
+    store::set_scope(&db, ids[2], Some(&one)).await.unwrap();
+    assert_eq!(store::scope_of(&db, ids[0]).await.unwrap(), None);
+    assert_eq!(
+        store::scope_of(&db, ids[1]).await.unwrap(),
+        Some(one.clone())
+    );
+    assert_eq!(store::scopes(&db).await.unwrap().len(), 2);
+
+    // A slot for one credential holds one for each record beside the global one.
+    store::bind(&db, "acme.single", ids[0], false)
+        .await
+        .unwrap();
+    store::bind(&db, "acme.single", ids[1], false)
+        .await
+        .unwrap();
+    let labels = |items: Vec<rainmill_vault::Item>| -> Vec<String> {
+        let mut l: Vec<String> = items.into_iter().map(|i| i.label).collect();
+        l.sort();
+        l
+    };
+    assert_eq!(
+        labels(store::items_of(&db, "acme.single").await.unwrap()),
+        ["Global", "Shop one"]
+    );
+    store::bind(&db, "acme.single", ids[2], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        labels(store::items_of(&db, "acme.single").await.unwrap()),
+        ["Global", "Shop one, newer"]
+    );
+
+    let token_of = |l: rainmill_vault::Lease| l.field("token").unwrap().to_string();
+    assert_eq!(
+        token_of(lease(&db, &crypt, "acme.single").await.unwrap()),
+        "tg"
+    );
+    assert_eq!(
+        token_of(lease_for(&db, &crypt, "acme.single", &one).await.unwrap()),
+        "t1b"
+    );
+    assert_eq!(
+        token_of(lease_for(&db, &crypt, "acme.single", &two).await.unwrap()),
+        "tg",
+        "a record with none of its own uses the global one"
+    );
+
+    // Made global again, it replaces the global one; deleted, its scope goes.
+    store::set_scope(&db, ids[2], None).await.unwrap();
+    store::bind(&db, "acme.single", ids[2], false)
+        .await
+        .unwrap();
+    assert_eq!(
+        labels(store::items_of(&db, "acme.single").await.unwrap()),
+        ["Shop one, newer"]
+    );
+    store::delete(&db, ids[1]).await.unwrap();
+    assert!(store::scopes(&db).await.unwrap().is_empty());
+
+    // Only global credentials left for one record means the others get none
+    // of that record's.
+    store::unbind(&db, "acme.single", ids[2]).await.unwrap();
+    store::set_scope(&db, ids[2], Some(&one)).await.unwrap();
+    store::bind(&db, "acme.single", ids[2], false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        lease(&db, &crypt, "acme.single").await,
+        Err(VaultError::Unbound(_))
+    ));
 }

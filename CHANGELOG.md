@@ -13,4 +13,5 @@ bump is breaking and a patch is additive.
 - Usage page for each slot: charts by meter, by credential and of calls against errors over a chosen period, with a price a unit, an estimated cost and a projection for the month.
 - `KindReg::category` files a kind under a `Category`; with several kinds the Credentials screen offers them from one New credential menu, grouped by category.
 - `ActionReg` adds a button to the page of every credential of a kind; its `Action` answers with a message or a `Report` of results, which may offer further actions. A report's rows can be tried one by one (`Action::parts`), each filling in as it comes back.
+- `ScopeReg` lets a credential belong to a record of another module (an app, say): the Credentials screen filters by it, and `lease_for` hands a record its own credential ahead of the global one. A kind's field can no longer be named `scope`.
 - `SlotReg::unit` and `SlotReg::meter`, and `Lease::used_as(meter, units)` to count a use under a meter.

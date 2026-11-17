@@ -76,3 +76,15 @@ pub(crate) enum VaultRates {
     Currency,
     UpdatedAt,
 }
+
+/// What an item belongs to. An item with no row is global.
+#[derive(Iden)]
+pub(crate) enum VaultItemScopes {
+    Table,
+    Id,
+    ItemId,
+    /// The registered scope's code.
+    ScopeType,
+    /// The id of the record it belongs to.
+    ScopeId,
+}
